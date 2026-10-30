@@ -1,0 +1,202 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#111417">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<title>Inventário de Paletes</title>
+<style>
+  :root {
+    --fundo: #111417; --painel: #1b2026; --painel2: #242b33; --linha: #313a44;
+    --texto: #eef2f5; --suave: #9aa7b3; --acento: #ffb020; --acento-texto: #1a1300;
+    --ok: #35c27a; --conferir: #ff5d5d; --aviso: #ffb020; --pendente: #6aa8ff;
+    --raio: 14px;
+  }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  [hidden] { display: none !important; }
+  html, body { margin: 0; height: 100%; background: var(--fundo); color: var(--texto);
+    font: 16px/1.35 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  body { display: flex; flex-direction: column; min-height: 100dvh; }
+  button { font: inherit; color: inherit; border: 0; border-radius: 12px; cursor: pointer; }
+  button:disabled { opacity: .45; }
+
+  header { display: flex; align-items: center; gap: 8px; padding: calc(env(safe-area-inset-top) + 8px) 12px 8px;
+    background: var(--painel); border-bottom: 1px solid var(--linha); }
+  #sessao { flex: 1; min-width: 0; text-align: left; background: none; padding: 4px 0; }
+  #sessao b { display: block; font-size: 15px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  #contadores { font-size: 13px; color: var(--suave); }
+  #contadores .c { color: var(--conferir); } #contadores .p { color: var(--pendente); }
+  .icone { width: 44px; height: 44px; background: var(--painel2); display: grid; place-items: center; flex: none; }
+  .icone svg { width: 22px; height: 22px; }
+
+  #camera { position: relative; background: #000; height: 52dvh; min-height: 260px; overflow: hidden; flex: none; }
+  video, #sobreposicao { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; }
+  #mira { position: absolute; left: 15%; right: 15%; top: 15%; bottom: 15%; border: 2px dashed rgba(255,255,255,.25);
+    border-radius: 10px; pointer-events: none; }
+  #situacao { position: absolute; left: 12px; right: 12px; bottom: 12px; padding: 10px 14px; border-radius: 12px;
+    background: rgba(17,20,23,.82); backdrop-filter: blur(6px); font-weight: 600; font-size: 17px;
+    display: flex; align-items: center; gap: 10px; }
+  #situacao .ponto { width: 12px; height: 12px; border-radius: 50%; background: var(--suave); flex: none; }
+  #situacao[data-tom="ok"] .ponto { background: var(--ok); }
+  #situacao[data-tom="aviso"] .ponto { background: var(--aviso); }
+  #situacao[data-tom="erro"] .ponto { background: var(--conferir); }
+  #situacao[data-tom="lendo"] .ponto { background: var(--pendente); animation: pulso 1s infinite; }
+  @keyframes pulso { 50% { opacity: .3; } }
+  #parado { position: absolute; inset: 0; z-index: 2; background: #000; display: grid; place-items: center; text-align: center; padding: 24px; color: var(--suave); }
+  #parado p { margin: 0; max-width: 300px; } #parado b { color: var(--texto); }
+
+  #controles { display: flex; gap: 8px; padding: 10px 12px; background: var(--painel); border-bottom: 1px solid var(--linha); }
+  #btnIniciar { flex: 1.4; min-height: 56px; background: var(--acento); color: var(--acento-texto); font-weight: 700; font-size: 18px; }
+  #btnIniciar.pausar { background: var(--painel2); color: var(--texto); }
+  #btnLer { flex: 1; min-height: 56px; background: var(--painel2); font-weight: 600; }
+  #btnLanterna { display: none; }
+
+  main { flex: 1; overflow-y: auto; padding: 4px 12px calc(env(safe-area-inset-bottom) + 84px); }
+  .vazio { color: var(--suave); text-align: center; padding: 28px 12px; }
+  .linha { display: flex; align-items: center; gap: 12px; padding: 12px 4px; border-bottom: 1px solid var(--linha);
+    width: 100%; background: none; text-align: left; border-radius: 0; }
+  .linha .n { color: var(--suave); font-size: 13px; width: 26px; text-align: right; flex: none; }
+  .linha .info { flex: 1; min-width: 0; }
+  .linha .cod { font-weight: 700; font-size: 18px; font-variant-numeric: tabular-nums; }
+  .linha .det { color: var(--suave); font-size: 13px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .linha .qtd { font-weight: 700; font-size: 18px; font-variant-numeric: tabular-nums; text-align: right; }
+  .selo { display: inline-block; font-size: 11px; font-weight: 700; padding: 2px 7px; border-radius: 99px; margin-left: 6px; vertical-align: 2px; }
+  .selo.conferir { background: rgba(255,93,93,.18); color: var(--conferir); }
+  .selo.repetido { background: rgba(255,176,32,.18); color: var(--aviso); }
+  .selo.pendente { background: rgba(106,168,255,.16); color: var(--pendente); }
+  .linha.lendo .cod { color: var(--pendente); font-weight: 600; font-size: 16px; }
+  .linha img { width: 44px; height: 44px; object-fit: cover; border-radius: 8px; flex: none; }
+
+  footer { position: fixed; left: 0; right: 0; bottom: 0; padding: 10px 12px calc(env(safe-area-inset-bottom) + 10px);
+    background: linear-gradient(transparent, var(--fundo) 30%); display: flex; gap: 8px; }
+  footer button { flex: 1; min-height: 52px; background: var(--painel2); font-weight: 600; border: 1px solid var(--linha); }
+  footer #btnExportar { background: var(--ok); color: #04170d; border: 0; }
+
+  dialog { width: min(560px, 100vw); max-width: 100vw; max-height: 92dvh; margin: auto auto 0; padding: 0; border: 0;
+    border-radius: 18px 18px 0 0; background: var(--painel); color: var(--texto); }
+  dialog::backdrop { background: rgba(0,0,0,.6); }
+  dialog form { padding: 18px 16px calc(env(safe-area-inset-bottom) + 16px); }
+  dialog h2 { margin: 0 0 4px; font-size: 20px; }
+  dialog p.sub { margin: 0 0 14px; color: var(--suave); font-size: 14px; }
+  .foto { width: 100%; max-height: 30dvh; object-fit: contain; background: #000; border-radius: 10px; margin-bottom: 12px; display: none; }
+  label { display: block; font-size: 13px; color: var(--suave); margin: 10px 0 4px; }
+  input, select { width: 100%; font: inherit; font-size: 18px; color: var(--texto); background: var(--fundo);
+    border: 1px solid var(--linha); border-radius: 10px; padding: 11px 12px; }
+  input:focus, select:focus { outline: 2px solid var(--acento); border-color: transparent; }
+  .grade { display: grid; grid-template-columns: 1fr 1fr; gap: 0 10px; }
+  .acoes { display: flex; gap: 8px; margin-top: 18px; }
+  .acoes button { flex: 1; min-height: 52px; background: var(--painel2); font-weight: 600; }
+  .acoes .primario { background: var(--acento); color: var(--acento-texto); }
+  .acoes .perigo { background: rgba(255,93,93,.15); color: var(--conferir); }
+  .alerta { background: rgba(255,93,93,.12); color: #ffb3b3; padding: 10px 12px; border-radius: 10px; font-size: 14px; margin-bottom: 10px; display: none; }
+  .nota { font-size: 13px; color: var(--suave); margin-top: 6px; }
+  .opcoes { display: flex; gap: 8px; }
+  .opcoes label { flex: 1; margin: 0; padding: 12px; border: 1px solid var(--linha); border-radius: 10px; color: var(--texto); font-size: 15px; }
+  .opcoes input { width: auto; margin-right: 6px; }
+  #teste { font-size: 14px; margin-top: 8px; min-height: 20px; }
+
+  #aviso { position: fixed; left: 12px; right: 12px; top: calc(env(safe-area-inset-top) + 70px); z-index: 10;
+    padding: 14px 16px; border-radius: 12px; background: var(--painel2); border: 1px solid var(--linha);
+    font-weight: 600; box-shadow: 0 8px 30px rgba(0,0,0,.4);
+    opacity: 0; visibility: hidden; transform: translateY(-12px); transition: opacity .2s, transform .2s, visibility .2s; }
+  #aviso.visivel { opacity: 1; visibility: visible; transform: none; }
+  #aviso[data-tom="ok"] { border-color: var(--ok); }
+  #aviso[data-tom="erro"] { border-color: var(--conferir); }
+</style>
+</head>
+<body>
+<header>
+  <button id="sessao" type="button" aria-label="Renomear sessão">
+    <b id="nomeSessao">Inventário</b>
+    <span id="contadores">0 paletes</span>
+  </button>
+  <button id="btnConfig" class="icone" type="button" aria-label="Configurações">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/></svg>
+  </button>
+</header>
+
+<section id="camera">
+  <video id="video" playsinline muted></video>
+  <canvas id="sobreposicao"></canvas>
+  <div id="mira"></div>
+  <div id="parado"><p>Toque em <b>Iniciar</b> e aponte a câmera para a etiqueta de cada palete.<br>Segure parado meio segundo em cada uma.</p></div>
+  <div id="situacao" data-tom="" hidden><span class="ponto"></span><span id="situacaoTexto"></span></div>
+</section>
+
+<section id="controles">
+  <button id="btnIniciar" type="button">Iniciar</button>
+  <button id="btnLer" type="button" disabled>Ler agora</button>
+  <button id="btnLanterna" class="icone" type="button" aria-label="Lanterna">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M8 2h8l-1 6H9z"/><path d="M9 8h6v4l-1 10h-4L9 12z"/></svg>
+  </button>
+</section>
+
+<main id="lista"><div class="vazio">Nenhum palete registrado nesta sessão.</div></main>
+
+<footer>
+  <button id="btnNovaSessao" type="button">Nova sessão</button>
+  <button id="btnExportar" type="button">Exportar Excel</button>
+</footer>
+
+<div id="aviso" role="status" aria-live="polite"></div>
+
+<!-- Configurações -->
+<dialog id="dlgConfig">
+  <form method="dialog">
+    <h2>Configurações</h2>
+    <p class="sub">O link de configuração gerado na planilha preenche o endereço e a senha automaticamente.</p>
+    <div class="alerta" id="cfgAlerta"></div>
+    <label for="cfgUrl">Endereço do script (Apps Script)</label>
+    <input id="cfgUrl" type="url" inputmode="url" placeholder="https://script.google.com/macros/s/.../exec" autocomplete="off">
+    <label for="cfgToken">Senha do app</label>
+    <input id="cfgToken" type="text" autocomplete="off" autocapitalize="off" spellcheck="false">
+    <label for="cfgOperador">Operador (opcional)</label>
+    <input id="cfgOperador" type="text" placeholder="Seu nome">
+    <label>Ao ler uma etiqueta</label>
+    <div class="opcoes">
+      <label><input type="radio" name="modo" value="auto" checked>Registrar sozinho</label>
+      <label><input type="radio" name="modo" value="confirmar">Pedir confirmação</label>
+    </div>
+    <label for="cfgAusencia">Tempo sem etiqueta para contar o próximo palete</label>
+    <select id="cfgAusencia">
+      <option value="800">0,8 s (andando rápido)</option>
+      <option value="1200" selected>1,2 s (recomendado)</option>
+      <option value="2000">2 s (paletes iguais bem separados)</option>
+    </select>
+    <div id="teste"></div>
+    <div class="acoes">
+      <button type="button" id="btnTestar">Testar conexão</button>
+      <button value="salvar" class="primario" id="btnSalvarCfg">Salvar</button>
+    </div>
+    <p class="nota">Versão 0.1</p>
+  </form>
+</dialog>
+
+<!-- Confirmar / editar leitura -->
+<dialog id="dlgRegistro">
+  <form method="dialog">
+    <h2 id="regTitulo">Confirmar leitura</h2>
+    <p class="sub" id="regSub"></p>
+    <img id="regFoto" class="foto" alt="Foto da etiqueta">
+    <div class="grade">
+      <div><label for="regCodigo">Código *</label><input id="regCodigo" autocomplete="off" autocapitalize="characters"></div>
+      <div><label for="regQtd">Quantidade *</label><input id="regQtd" inputmode="decimal" autocomplete="off"></div>
+      <div><label for="regLote">Lote</label><input id="regLote" autocomplete="off" autocapitalize="characters"></div>
+      <div><label for="regValidade">Validade</label><input id="regValidade" inputmode="numeric" placeholder="DD/MM/AAAA" autocomplete="off"></div>
+    </div>
+    <label for="regItem">Item</label><input id="regItem" autocomplete="off">
+    <label for="regFornecedor">Fornecedor</label><input id="regFornecedor" autocomplete="off" autocapitalize="characters">
+    <div class="acoes">
+      <button value="excluir" class="perigo" id="regExcluir">Descartar</button>
+      <button value="salvar" class="primario" id="regSalvar">Adicionar</button>
+    </div>
+  </form>
+</dialog>
+
+<script src="xlsx.full.min.js" defer></script>
+<script src="detector.js" defer></script>
+<script src="logic.js" defer></script>
+<script src="app.js" defer></script>
+</body>
+</html>
