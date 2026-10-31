@@ -1,16 +1,24 @@
 /*
- * app.js — Inventário de Paletes v0.1
+ * app.js — Inventário de Paletes v0.2
  * Câmera → detector (quando ler) → Apps Script/Gemini (o que está escrito)
  * → lista local + Google Sheets → Excel.
+ *
+ * v0.2: fila de leitura persistente (sem internet, as fotos ficam guardadas no
+ * celular e são lidas quando a conexão volta), zoom (óptico quando o aparelho
+ * permite, digital nos demais) e foto manual pela câmera do próprio celular.
  */
 (function () {
   'use strict';
 
-  var VERSAO = '0.1';
+  var VERSAO = '0.2';
   var CHAVE = 'inv.v1.';
   var INTERVALO_ANALISE_MS = 125;      // ~8 análises por segundo
   var LADO_MAX_ENVIO = 1600;           // px do maior lado da foto enviada ao Gemini
   var JANELA_REPETIDO_MS = 2500;      // re-registro quase imediato = provável tremida, não palete novo
+  var LADO_MAX_FOTO = 2000;            // foto manual (câmera nativa): um pouco maior, a etiqueta pode estar longe
+  var TEMPO_LIMITE_REDE_MS = 20000;    // sem resposta nesse tempo = trata como sem internet
+  var LIBERAR_APOS_MS = 6000;          // leitura demorando: libera o operador para o próximo palete
+  var ZOOM_DIGITAL_MAX = 4;
 
   // ------------------------------------------------------------- estado
   var cfg = carregar('config', { url: '', token: '', operador: '', modo: 'auto', ausenciaMs: 1200, som: true });
@@ -25,6 +33,8 @@
   var rodando = false, stream = null, trilha = null, timer = null, wakeLock = null;
   var cinzaAnterior = null, ultimaAnalise = null;
   var sincronizando = false, falhasSync = 0;
+  var redeOk = navigator.onLine !== false;
+  var zoom = { hw: null, valor: 1 };   // hw = {min,max} quando a câmera tem zoom óptico/nativo
 
   var $ = function (id) { return document.getElementById(id); };
   var video = $('video'), sobre = $('sobreposicao');
@@ -41,10 +51,52 @@
   }
   function salvarRegistros() { guardar('registros', registros); }
 
+  // Fila de leitura e fotos de conferência ficam no IndexedDB (aguentam fechar o app).
+  var db = null;
+  function abrirDB() {
+    return new Promise(function (ok) {
+      try {
+        var rq = indexedDB.open('inventario-paletes', 1);
+        rq.onupgradeneeded = function () {
+          rq.result.createObjectStore('fila', { keyPath: 'id' });
+          rq.result.createObjectStore('fotos', { keyPath: 'id' });
+        };
+        rq.onsuccess = function () { db = rq.result; ok(db); };
+        rq.onerror = function () { ok(null); };
+      } catch (e) { ok(null); }
+    });
+  }
+  function dbOp(loja, modo, fn) {
+    return new Promise(function (ok) {
+      if (!db) { ok(null); return; }
+      try {
+        var tx = db.transaction(loja, modo), st = tx.objectStore(loja), rq = fn(st);
+        tx.oncomplete = function () { ok(rq && rq.result); };
+        tx.onerror = tx.onabort = function () { ok(null); };
+      } catch (e) { ok(null); }
+    });
+  }
+  function filaGuardar(c) {
+    var o = {}; for (var k in c) if (k !== 'foto') o[k] = c[k];
+    return dbOp('fila', 'readwrite', function (st) { return st.put(o); });
+  }
+  function filaRemover(id) { return dbOp('fila', 'readwrite', function (st) { return st.delete(id); }); }
+  function fotoGuardar(id, dataUrl) { return dbOp('fotos', 'readwrite', function (st) { return st.put({ id: id, foto: dataUrl }); }); }
+  function fotoLer(id) { return dbOp('fotos', 'readonly', function (st) { return st.get(id); }).then(function (r) { return r && r.foto; }); }
+  function fotoRemover(id) { return dbOp('fotos', 'readwrite', function (st) { return st.delete(id); }); }
+
   function novaSessaoNome() {
     var d = new Date();
     var p = function (n) { return (n < 10 ? '0' : '') + n; };
     return 'Inventário ' + p(d.getDate()) + '/' + p(d.getMonth() + 1) + '/' + d.getFullYear() + ' ' + p(d.getHours()) + ':' + p(d.getMinutes());
+  }
+  /** Evita juntar duas sessões criadas no mesmo minuto (mesmo nome). */
+  function nomeSessaoUnico(nome) {
+    var usados = {}; usados[sessao] = true;
+    registros.forEach(function (r) { usados[r.sessao] = true; });
+    var n = nome, i = 2;
+    while (usados[n]) n = nome + ' (' + (i++) + ')';
+    return n;
   }
   function novaMaquina() { return new Logica.Maquina({ tempoAusenciaMs: Number(cfg.ausenciaMs) || 1200 }); }
   function uid() { return Date.now().toString(36) + Math.random().toString(36).slice(2, 8); }
@@ -103,24 +155,34 @@
   function fmtQtd(r) {
     return typeof r.quantidade === 'number' ? r.quantidade.toLocaleString('pt-BR') : (r.quantidadeTexto || '—');
   }
+  function horaCurta(iso) {
+    var d = new Date(iso), p = function (n) { return (n < 10 ? '0' : '') + n; };
+    return p(d.getHours()) + ':' + p(d.getMinutes()) + ':' + p(d.getSeconds());
+  }
   function esc(s) { return String(s == null ? '' : s).replace(/[&<>"]/g, function (c) { return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]; }); }
 
   function renderizar() {
     var lista = daSessao();
     var conferir = lista.filter(function (r) { return r.status === 'CONFERIR'; }).length;
     var pend = registros.filter(function (r) { return r.pendente; }).length;
-    $('nomeSessao').textContent = sessao;
-    $('contadores').innerHTML = lista.length + (lista.length === 1 ? ' palete' : ' paletes') +
-      (conferir ? ' · <span class="c">' + conferir + ' a conferir</span>' : '') +
-      (pend ? ' · <span class="p">' + pend + ' sem enviar</span>' : '') +
-      (filaLeitura.length + (lendo ? 1 : 0) ? ' · lendo ' + (filaLeitura.length + (lendo ? 1 : 0)) : '');
-
-    var html = '';
     var emLeitura = filaLeitura.slice();
     if (lendo && lendo.miniatura) emLeitura.unshift(lendo);
+    var aguardando = emLeitura.length;
+    $('nomeSessao').textContent = sessao;
+    $('contadores').innerHTML = lista.length + (lista.length === 1 ? ' palete' : ' paletes') +
+      (aguardando ? ' · <span class="p">' + aguardando + ' aguardando leitura</span>' : '') +
+      (conferir ? ' · <span class="c">' + conferir + ' a conferir</span>' : '') +
+      (pend ? ' · <span class="p">' + pend + ' sem enviar</span>' : '');
+    $('rede').hidden = redeOk;
+
+    var html = '';
     emLeitura.forEach(function (c) {
+      var txt = !redeOk || c.semRede ? 'Guardada — leio quando a internet voltar'
+        : c.esperaAte > Date.now() ? 'Aguardando o Gemini…' : 'Lendo etiqueta…';
       html += '<div class="linha lendo"><span class="n"></span><img src="' + c.miniatura + '" alt="">' +
-        '<div class="info"><div class="cod">' + (c.esperaAte > Date.now() ? 'Aguardando limite do Gemini…' : 'Lendo etiqueta…') + '</div></div></div>';
+        '<div class="info"><div class="cod">' + txt + '</div><div class="det">' +
+        (c.origem === 'foto' ? 'Foto manual · ' : '') + horaCurta(c.dataHora) +
+        (!redeOk || c.semRede ? '<span class="selo offline">sem internet</span>' : '') + '</div></div></div>';
     });
     for (var i = lista.length - 1; i >= 0; i--) {
       var r = lista[i];
@@ -150,9 +212,10 @@
       aviso('Este navegador não dá acesso à câmera. Abra o link pelo Chrome ou Safari (endereço https).', 'erro', 6000);
       return;
     }
-    navigator.mediaDevices.getUserMedia({
-      audio: false,
-      video: { facingMode: { ideal: 'environment' }, width: { ideal: 1920 }, height: { ideal: 1080 } }
+    var video_ = { facingMode: { ideal: 'environment' }, width: { ideal: 2560 }, height: { ideal: 1440 } };
+    var comZoom = Object.assign({ zoom: true }, video_); // zoom:true pede acesso ao zoom da câmera (Chrome/Android)
+    navigator.mediaDevices.getUserMedia({ audio: false, video: comZoom }).catch(function () {
+      return navigator.mediaDevices.getUserMedia({ audio: false, video: video_ });
     }).then(function (s) {
       stream = s; trilha = s.getVideoTracks()[0];
       video.srcObject = s;
@@ -166,6 +229,7 @@
       $('btnLer').disabled = false;
       situacao('Procurando etiqueta…');
       prepararLanterna();
+      prepararZoom();
       manterTelaLigada();
       timer = setInterval(analisar, INTERVALO_ANALISE_MS);
     }).catch(function (e) {
@@ -183,6 +247,7 @@
     $('situacao').hidden = true;
     $('btnIniciar').textContent = 'Iniciar'; $('btnIniciar').classList.remove('pausar');
     $('btnLer').disabled = true; $('btnLanterna').style.display = 'none';
+    $('zoom').hidden = true; video.style.transform = '';
     limparSobreposicao();
   }
 
@@ -205,11 +270,75 @@
     trilha.applyConstraints({ advanced: [{ torch: lanternaLigada }] }).catch(function () { lanternaLigada = false; });
   });
 
+  // ------------------------------------------------------------------ zoom
+  function prepararZoom() {
+    var cap = trilha && trilha.getCapabilities ? trilha.getCapabilities() : {};
+    zoom.hw = cap.zoom && cap.zoom.max > 1 ? { min: cap.zoom.min || 1, max: cap.zoom.max } : null;
+    $('zoom').hidden = false;
+    aplicarZoom(zoom.valor || 1, true);
+  }
+  function zoomMax() { return zoom.hw ? Math.min(zoom.hw.max, 10) : ZOOM_DIGITAL_MAX; }
+  function zoomDigital() { return zoom.hw ? 1 : zoom.valor; }
+  function aplicarZoom(z, silencioso) {
+    z = Math.max(1, Math.min(zoomMax(), Math.round(z * 10) / 10));
+    zoom.valor = z;
+    if (zoom.hw && trilha) {
+      video.style.transform = '';
+      trilha.applyConstraints({ advanced: [{ zoom: Math.max(zoom.hw.min, z) }] }).catch(function () {
+        zoom.hw = null; aplicarZoom(z, silencioso); // aparelho recusou: cai para o zoom digital
+      });
+    } else {
+      video.style.transform = z > 1 ? 'scale(' + z + ')' : '';
+    }
+    Array.prototype.forEach.call(document.querySelectorAll('#zoom button'), function (b) {
+      var bz = Number(b.dataset.z);
+      b.hidden = bz > zoomMax();
+      b.classList.toggle('ativo', Math.abs(bz - z) < 0.05);
+    });
+    cinzaAnterior = null; // a imagem muda inteira: não é "movimento"
+    if (!silencioso) {
+      var el = $('zoomValor'); el.textContent = z.toFixed(1).replace('.0', '') + '×'; el.classList.add('visivel');
+      clearTimeout(aplicarZoom.t); aplicarZoom.t = setTimeout(function () { el.classList.remove('visivel'); }, 900);
+    }
+  }
+  $('zoom').addEventListener('click', function (ev) {
+    var b = ev.target.closest('button[data-z]');
+    if (b) aplicarZoom(Number(b.dataset.z));
+  });
+  // pinça com dois dedos sobre a imagem
+  (function pinca() {
+    var toques = {}, inicio = null;
+    function dist() {
+      var p = Object.keys(toques).map(function (k) { return toques[k]; });
+      return p.length < 2 ? 0 : Math.hypot(p[0].x - p[1].x, p[0].y - p[1].y);
+    }
+    var area = $('camera');
+    area.addEventListener('pointerdown', function (e) {
+      toques[e.pointerId] = { x: e.clientX, y: e.clientY };
+      if (Object.keys(toques).length === 2) inicio = { d: dist(), z: zoom.valor };
+    });
+    area.addEventListener('pointermove', function (e) {
+      if (!toques[e.pointerId]) return;
+      toques[e.pointerId] = { x: e.clientX, y: e.clientY };
+      if (inicio && inicio.d > 0 && rodando) aplicarZoom(inicio.z * dist() / inicio.d);
+    });
+    function fim(e) { delete toques[e.pointerId]; if (Object.keys(toques).length < 2) inicio = null; }
+    area.addEventListener('pointerup', fim); area.addEventListener('pointercancel', fim); area.addEventListener('pointerleave', fim);
+  })();
+
+  /** Região do vídeo que o operador está vendo (recorte central quando há zoom digital). */
+  function regiao() {
+    var vw = video.videoWidth, vh = video.videoHeight, z = zoomDigital();
+    var sw = vw / z, sh = vh / z;
+    return { sx: (vw - sw) / 2, sy: (vh - sh) / 2, sw: sw, sh: sh };
+  }
+
   function analisar() {
     if (!rodando || video.readyState < 2 || !video.videoWidth) return;
-    var w = Detector.DEFAULTS.largura, h = Math.round(video.videoHeight * w / video.videoWidth);
-    if (cAnalise.width !== w || cAnalise.height !== h) { cAnalise.width = w; cAnalise.height = h; }
-    ctxAnalise.drawImage(video, 0, 0, w, h);
+    var rg = regiao();
+    var w = Detector.DEFAULTS.largura, h = Math.round(rg.sh * w / rg.sw);
+    if (cAnalise.width !== w || cAnalise.height !== h) { cAnalise.width = w; cAnalise.height = h; cinzaAnterior = null; }
+    ctxAnalise.drawImage(video, rg.sx, rg.sy, rg.sw, rg.sh, 0, 0, w, h);
     var r = Detector.analisar(ctxAnalise.getImageData(0, 0, w, h));
     var mov = cinzaAnterior ? Detector.movimento(cinzaAnterior, r.cinza) : 255;
     cinzaAnterior = r.cinza;
@@ -225,7 +354,7 @@
     if (situacaoFixa && situacaoFixa.ate > Date.now()) { situacao(situacaoFixa.msg, situacaoFixa.tom); return; }
     if (!r.presente) situacao('Procurando etiqueta…');
     else if (maquina.estado === 'BLOQUEADO') situacao('Já registrado — siga para o próximo palete', 'ok');
-    else if (maquina.estado === 'AGUARDANDO') situacao('Lendo etiqueta…', 'lendo');
+    else if (maquina.estado === 'AGUARDANDO') situacao(redeOk ? 'Lendo etiqueta…' : 'Guardando foto…', 'lendo');
     else if (!r.centralizada) situacao('Centralize a etiqueta', 'aviso');
     else if (mov > maquina.limiarMovimento) situacao('Segure firme…', 'aviso');
     else situacao('Segure firme…', 'aviso');
@@ -238,10 +367,11 @@
     var ctx = sobre.getContext('2d');
     ctx.clearRect(0, 0, dw, dh);
     if (!r.caixa) return;
-    // mapeia coordenadas do vídeo (object-fit: cover) para a tela
-    var vw = video.videoWidth, vh = video.videoHeight, esc = Math.max(dw / vw, dh / vh);
-    var ox = (dw - vw * esc) / 2, oy = (dh - vh * esc) / 2;
-    var x = ox + r.caixa.x * vw * esc, y = oy + r.caixa.y * vh * esc, w = r.caixa.w * vw * esc, h = r.caixa.h * vh * esc;
+    // mapeia coordenadas do recorte analisado para a tela (object-fit: cover + zoom digital)
+    var vw = video.videoWidth, vh = video.videoHeight, rg = regiao();
+    var esc = Math.max(dw / vw, dh / vh) * zoomDigital();
+    var x = dw / 2 + (rg.sx + r.caixa.x * rg.sw - vw / 2) * esc, y = dh / 2 + (rg.sy + r.caixa.y * rg.sh - vh / 2) * esc;
+    var w = r.caixa.w * rg.sw * esc, h = r.caixa.h * rg.sh * esc;
     ctx.lineWidth = 4;
     ctx.strokeStyle = maquina.estado === 'BLOQUEADO' ? '#35c27a' : r.centralizada ? '#ffb020' : 'rgba(255,255,255,.6)';
     ctx.beginPath();
@@ -251,64 +381,151 @@
   function limparSobreposicao() { sobre.getContext('2d').clearRect(0, 0, sobre.width, sobre.height); }
 
   // ------------------------------------------------------------- captura
-  function capturar(acao) {
-    var vw = video.videoWidth, vh = video.videoHeight;
-    var esc = Math.min(1, LADO_MAX_ENVIO / Math.max(vw, vh));
-    cCaptura.width = Math.round(vw * esc); cCaptura.height = Math.round(vh * esc);
-    cCaptura.getContext('2d').drawImage(video, 0, 0, cCaptura.width, cCaptura.height);
+  /** Desenha `fonte` (recorte sx,sy,sw,sh) num JPEG de no máximo `lado` px; devolve dataURL e miniatura. */
+  function gerarJpeg(fonte, sx, sy, sw, sh, lado) {
+    var e = Math.min(1, lado / Math.max(sw, sh));
+    cCaptura.width = Math.round(sw * e); cCaptura.height = Math.round(sh * e);
+    cCaptura.getContext('2d').drawImage(fonte, sx, sy, sw, sh, 0, 0, cCaptura.width, cCaptura.height);
     var dataUrl = cCaptura.toDataURL('image/jpeg', 0.85);
     var t = document.createElement('canvas');
     var te = 240 / Math.max(cCaptura.width, cCaptura.height);
     t.width = Math.round(cCaptura.width * te); t.height = Math.round(cCaptura.height * te);
     t.getContext('2d').drawImage(cCaptura, 0, 0, t.width, t.height);
-    filaLeitura.push({
-      id: uid(), aparicao: acao.aparicao, manual: !!acao.manual, dataHora: new Date().toISOString(),
-      imagem: dataUrl.slice(dataUrl.indexOf(',') + 1), foto: dataUrl, miniatura: t.toDataURL('image/jpeg', 0.7),
-      tentativasRede: 0, esperaAte: 0
-    });
+    return { foto: dataUrl, imagem: dataUrl.slice(dataUrl.indexOf(',') + 1), miniatura: t.toDataURL('image/jpeg', 0.7) };
+  }
+
+  function capturar(acao) {
+    var rg = regiao();
+    var j = gerarJpeg(video, rg.sx, rg.sy, rg.sw, rg.sh, LADO_MAX_ENVIO);
+    enfileirar({ aparicao: acao.aparicao, manual: !!acao.manual, origem: acao.manual ? 'ler agora' : 'automático',
+      imagem: j.imagem, foto: j.foto, miniatura: j.miniatura });
+  }
+
+  function enfileirar(dados) {
+    var c = Object.assign({
+      id: uid(), dataHora: new Date().toISOString(), sessao: sessao, operador: cfg.operador || '',
+      tentativasRede: 0, esperaAte: 0, semRede: false, liberado: false
+    }, dados);
+    filaLeitura.push(c);
+    filaGuardar(c);
     renderizar();
     processarFila();
+    return c;
   }
 
   $('btnLer').addEventListener('click', function () {
     if (!rodando) return;
     capturar(maquina.forcar(Date.now()));
-    fixarSituacao('Lendo etiqueta…', 'lendo');
+    fixarSituacao(redeOk ? 'Lendo etiqueta…' : 'Foto guardada', 'lendo');
   });
 
+  // ------------------------------------------- foto manual (câmera do celular)
+  // Abre a câmera nativa do aparelho: zoom óptico, foco e resolução máximos.
+  var retomarAposFoto = false;
+  $('btnFoto').addEventListener('click', function () {
+    retomarAposFoto = rodando;
+    if (rodando) pausar(); // libera a câmera para o app de câmera do celular
+    $('inputFoto').value = '';
+    $('inputFoto').click();
+    window.addEventListener('focus', function voltar() {
+      window.removeEventListener('focus', voltar);
+      setTimeout(function () { if (retomarAposFoto && !rodando) { retomarAposFoto = false; iniciar(); } }, 1200);
+    });
+  });
+  $('inputFoto').addEventListener('change', function () {
+    var arq = this.files && this.files[0];
+    if (!arq) return;
+    lerArquivoFoto(arq).then(function (j) {
+      enfileirar({ aparicao: null, manual: true, origem: 'foto', imagem: j.imagem, foto: j.foto, miniatura: j.miniatura });
+      bip('ok');
+      aviso(redeOk ? 'Foto recebida — lendo…' : 'Foto guardada — leio quando a internet voltar', 'ok');
+    }).catch(function () {
+      aviso('Não consegui abrir a foto. Tente de novo.', 'erro', 4000);
+    }).then(function () {
+      if (retomarAposFoto && !rodando) { retomarAposFoto = false; iniciar(); }
+    });
+  });
+  function lerArquivoFoto(arq) {
+    var abrir = window.createImageBitmap
+      ? createImageBitmap(arq, { imageOrientation: 'from-image' }).catch(function () { return createImageBitmap(arq); })
+      : new Promise(function (ok, erro) {
+        var img = new Image(); img.onload = function () { ok(img); }; img.onerror = erro; img.src = URL.createObjectURL(arq);
+      });
+    return abrir.then(function (img) {
+      var w = img.width || img.naturalWidth, h = img.height || img.naturalHeight;
+      return gerarJpeg(img, 0, 0, w, h, LADO_MAX_FOTO);
+    });
+  }
+
   // --------------------------------------------------- servidor (Apps Script)
-  function chamar(corpo) {
+  function chamar(corpo, limiteMs) {
     corpo.token = cfg.token;
+    var ctrl = window.AbortController ? new AbortController() : null;
+    var t = ctrl ? setTimeout(function () { ctrl.abort(); }, limiteMs || TEMPO_LIMITE_REDE_MS) : null;
     return fetch(cfg.url, {
       method: 'POST', redirect: 'follow',
       headers: { 'Content-Type': 'text/plain;charset=utf-8' }, // evita pré-verificação CORS
-      body: JSON.stringify(corpo)
+      body: JSON.stringify(corpo), signal: ctrl ? ctrl.signal : undefined
     }).then(function (r) {
+      clearTimeout(t);
       if (!r.ok) throw new Error('HTTP ' + r.status);
       return r.json();
-    });
+    }, function (e) { clearTimeout(t); throw e; });
   }
+  function marcarRede(ok) {
+    if (redeOk === ok) return;
+    redeOk = ok;
+    renderizar();
+    if (ok) { aviso('Internet de volta — lendo as fotos guardadas.', 'ok'); sincronizar(); }
+  }
+
+  /**
+   * Libera o operador para seguir em frente sem esperar a leitura: a foto já está
+   * guardada e será lida assim que possível (sem internet ou internet lenta).
+   */
+  function liberar(c, motivo) {
+    if (c.liberado) return;
+    c.liberado = true;
+    filaGuardar(c);
+    if (c.aparicao != null) maquina.resultado(c.aparicao, 'registrado');
+    if (c.origem !== 'foto') {
+      bip('ok');
+      fixarSituacao(motivo === 'rede' ? 'Foto guardada ✓ — leio quando a internet voltar' : 'Foto guardada ✓ — siga para o próximo', 'ok', 2200);
+    }
+  }
+
+  var timerFila = null;
+  function agendarFila(ms) { clearTimeout(timerFila); timerFila = setTimeout(processarFila, ms); }
 
   function processarFila() {
     if (lendo || !filaLeitura.length) return;
     var agora = Date.now();
     var c = filaLeitura[0];
-    if (c.esperaAte > agora) { setTimeout(processarFila, c.esperaAte - agora); return; }
+    if (!redeOk && navigator.onLine === false) {
+      filaLeitura.forEach(function (x) { x.semRede = true; liberar(x, 'rede'); });
+      renderizar();
+      agendarFila(15000); // o evento "online" também dispara a fila
+      return;
+    }
+    if (c.esperaAte > agora) { agendarFila(c.esperaAte - agora); return; }
     lendo = filaLeitura.shift();
     renderizar();
+    var lenta = setTimeout(function () { liberar(c, 'lenta'); }, LIBERAR_APOS_MS);
     chamar({ acao: 'ler', imagem: c.imagem }).then(function (resp) {
+      clearTimeout(lenta);
+      marcarRede(true);
+      c.semRede = false;
       tratarLeitura(c, resp);
-    }).catch(function (e) {
+    }).catch(function () {
+      clearTimeout(lenta);
+      // sem internet, Wi-Fi caiu ou resposta não veio: a foto continua na fila, nunca se perde
       c.tentativasRede++;
-      if (c.tentativasRede <= 4) {
-        c.esperaAte = Date.now() + 1500 * c.tentativasRede;
-        filaLeitura.unshift(c);
-        fixarSituacao('Sem conexão — tentando de novo…', 'erro');
-      } else {
-        bip('erro');
-        aviso('Não consegui enviar a foto (sem conexão). Leia este palete de novo.', 'erro', 5000);
-        maquina.resultado(c.aparicao, 'tentar');
-      }
+      c.semRede = true;
+      c.esperaAte = Date.now() + Math.min(30000, 3000 * c.tentativasRede);
+      filaLeitura.unshift(c);
+      filaGuardar(c);
+      marcarRede(false);
+      liberar(c, 'rede');
     }).then(function () {
       lendo = false;
       renderizar();
@@ -316,39 +533,51 @@
     });
   }
 
+  /** Tira um item da fila (lido ou descartado). */
+  function concluirItem(c) { filaRemover(c.id); }
+
   function tratarLeitura(c, resp) {
+    var depois = c.liberado; // o operador já seguiu em frente (sem internet / leitura lenta)
     if (!resp || !resp.ok) {
       var erro = resp && resp.erro;
       if ((erro === 'limite' || erro === 'gemini') && resp.tentarEmMs) {
         c.esperaAte = Date.now() + resp.tentarEmMs;
         filaLeitura.unshift(c);
-        fixarSituacao(erro === 'limite' ? 'Limite do Gemini — continuo em ' + Math.ceil(resp.tentarEmMs / 1000) + ' s' : 'Gemini instável — tentando de novo', 'aviso', 2500);
+        if (!depois) fixarSituacao(erro === 'limite' ? 'Limite do Gemini — continuo em ' + Math.ceil(resp.tentarEmMs / 1000) + ' s' : 'Gemini instável — tentando de novo', 'aviso', 2500);
         return;
       }
-      bip('erro');
-      maquina.resultado(c.aparicao, 'tentar');
-      if (erro === 'senha' || erro === 'chave') { pausar(); abrirConfig(resp.mensagem); }
-      else aviso(resp && resp.mensagem || 'Erro na leitura.', 'erro', 5000);
+      if (erro === 'senha' || erro === 'chave') {
+        // problema de configuração: guarda a foto e para tudo até corrigir
+        c.esperaAte = Date.now() + 60000; filaLeitura.unshift(c); filaGuardar(c);
+        bip('erro'); pausar(); abrirConfig(resp.mensagem);
+        return;
+      }
+      registrarNaoLida(c, resp && resp.mensagem || 'erro na leitura');
       return;
     }
     if (resp.acao !== 'registrar') {
-      var res = maquina.resultado(c.aparicao, 'tentar');
-      if (c.manual) { bip('erro'); aviso(resp.motivo || 'Não encontrei a etiqueta.', 'erro'); }
+      if (depois || c.origem === 'foto' && c.semRede) { registrarNaoLida(c, resp.motivo); return; }
+      concluirItem(c);
+      var res = c.aparicao != null ? maquina.resultado(c.aparicao, 'tentar') : 'manual';
+      if (c.manual) { bip('erro'); aviso((resp.motivo || 'Não encontrei a etiqueta') + '. Tire outra foto, mais de perto.', 'erro', 4000); }
       else if (res === 'desistiu') {
         bip('erro');
-        aviso('Não consegui ler esta etiqueta. Aproxime ou toque em "Ler agora".', 'erro', 4000);
+        aviso('Não consegui ler esta etiqueta. Use o zoom, "Ler agora" ou "Foto".', 'erro', 4000);
       }
       return;
     }
-    maquina.resultado(c.aparicao, 'registrado');
+    if (c.aparicao != null) maquina.resultado(c.aparicao, 'registrado');
+    concluirItem(c);
     var r = resp.registro;
     var reg = {
-      id: c.id, dataHora: c.dataHora, sessao: sessao, operador: cfg.operador || '',
+      id: c.id, dataHora: c.dataHora, sessao: c.sessao || sessao, operador: c.operador || cfg.operador || '',
       codigo: r.codigo, item: r.item, lote: r.lote, validade: r.validade, fornecedor: r.fornecedor,
       quantidade: r.quantidade, quantidadeTexto: r.quantidadeTexto, status: r.status, observacao: r.observacao,
-      modo: c.manual ? 'manual' : 'automático'
+      modo: c.origem + (depois ? ' · lido depois' : '')
     };
-    miniaturas[reg.id] = c.foto;
+    miniaturas[reg.id] = c.foto || ('data:image/jpeg;base64,' + c.imagem);
+    if (reg.status === 'CONFERIR') fotoGuardar(reg.id, miniaturas[reg.id]);
+    if (depois) { adicionar(reg, true); return; } // não abre confirmação fora de hora
     if (cfg.modo === 'confirmar') {
       filaConfirmacao.push(reg);
       if (!editando) proximaConfirmacao();
@@ -358,13 +587,30 @@
     adicionar(reg);
   }
 
-  function adicionar(reg) {
-    var anteriores = daSessao();
+  /** Foto que não pôde ser lida depois que o operador já seguiu: entra como CONFERIR, com a foto. */
+  function registrarNaoLida(c, motivo) {
+    if (c.aparicao != null) maquina.resultado(c.aparicao, 'registrado');
+    concluirItem(c);
+    var reg = {
+      id: c.id, dataHora: c.dataHora, sessao: c.sessao || sessao, operador: c.operador || cfg.operador || '',
+      codigo: '', item: '', lote: '', validade: '', fornecedor: '', quantidade: null, quantidadeTexto: '',
+      status: 'CONFERIR', observacao: 'etiqueta não lida (' + (motivo || 'sem leitura') + ') — veja a foto',
+      modo: c.origem + (c.liberado ? ' · lido depois' : '')
+    };
+    miniaturas[reg.id] = c.foto || ('data:image/jpeg;base64,' + c.imagem);
+    fotoGuardar(reg.id, miniaturas[reg.id]);
+    adicionar(reg, true);
+  }
+
+  function adicionar(reg, silencioso) {
+    var anteriores = registros.filter(function (r) { return r.sessao === reg.sessao && !r.excluido; });
     reg.possivelRepetido = Logica.possivelRepetido(anteriores[anteriores.length - 1], reg, JANELA_REPETIDO_MS);
     reg.pendente = true;
     registros.push(reg);
     salvarRegistros();
     renderizar();
+    sincronizar();
+    if (silencioso) return;
     var q = typeof reg.quantidade === 'number' ? reg.quantidade.toLocaleString('pt-BR') : (reg.quantidadeTexto || '?');
     if (reg.status === 'OK') {
       bip('ok');
@@ -373,7 +619,6 @@
       bip('conferir');
       fixarSituacao('Registrado — CONFERIR  ' + (reg.codigo || '???') + ' · ' + q, 'erro', 3000);
     }
-    sincronizar();
   }
 
   // Envia à planilha tudo que está pendente (novos, editados e excluídos).
@@ -395,6 +640,7 @@
       salvarRegistros();
     }).catch(function () {
       falhasSync++;
+      if (falhasSync >= 2) marcarRede(false);
     }).then(function () {
       sincronizando = false;
       renderizar();
@@ -403,7 +649,8 @@
       }
     });
   }
-  window.addEventListener('online', sincronizar);
+  window.addEventListener('online', function () { marcarRede(true); filaLeitura.forEach(function (c) { c.esperaAte = 0; }); processarFila(); sincronizar(); });
+  window.addEventListener('offline', function () { marcarRede(false); processarFila(); });
 
   // ------------------------------------------------ confirmar / editar
   function proximaConfirmacao() {
@@ -421,6 +668,7 @@
     var foto = miniaturas[r.id];
     $('regFoto').style.display = foto ? 'block' : 'none';
     if (foto) $('regFoto').src = foto;
+    else fotoLer(r.id).then(function (f) { if (f && editando && editando.registro === r) { $('regFoto').src = f; $('regFoto').style.display = 'block'; } });
     $('regCodigo').value = r.codigo || '';
     $('regQtd').value = typeof r.quantidade === 'number' ? r.quantidade.toLocaleString('pt-BR') : (r.quantidadeTexto || '');
     $('regLote').value = r.lote || '';
@@ -446,6 +694,7 @@
         .forEach(function (k) { r[k] = novo[k]; });
       if (o.edicao) {
         r.modo = 'editado'; r.pendente = true; r.possivelRepetido = false;
+        if (r.status === 'OK') fotoRemover(r.id);
         salvarRegistros(); renderizar(); sincronizar();
         aviso('Palete atualizado.', 'ok');
       } else {
@@ -454,7 +703,7 @@
       }
     } else if (acao === 'excluir' && o.edicao) {
       if (confirm('Excluir este palete da contagem?')) {
-        r.excluido = true; r.pendente = true;
+        r.excluido = true; r.pendente = true; fotoRemover(r.id);
         salvarRegistros(); renderizar(); sincronizar();
         aviso('Palete excluído.', 'ok');
       }
@@ -508,14 +757,14 @@
   $('sessao').addEventListener('click', function () {
     var n = prompt('Nome desta sessão de inventário:', sessao);
     if (!n || !n.trim()) return;
-    var antigo = sessao; sessao = n.trim();
+    var antigo = sessao; sessao = n.trim() === antigo ? antigo : nomeSessaoUnico(n.trim());
     registros.forEach(function (r) { if (r.sessao === antigo && !r.excluido) { r.sessao = sessao; r.pendente = true; } });
     guardar('sessao', sessao); salvarRegistros(); renderizar(); sincronizar();
   });
   $('btnNovaSessao').addEventListener('click', function () {
     var lista = daSessao();
     if (lista.length && !confirm('Começar uma nova sessão? A atual (' + lista.length + ' paletes) continua salva na planilha.')) return;
-    sessao = novaSessaoNome(); guardar('sessao', sessao);
+    sessao = nomeSessaoUnico(novaSessaoNome()); guardar('sessao', sessao);
     maquina = novaMaquina();
     renderizar();
     aviso('Nova sessão: ' + sessao, 'ok');
@@ -534,9 +783,19 @@
       return o;
     });
   }
+  function aguardandoComoLinhas() {
+    var itens = filaLeitura.slice(); if (lendo) itens.unshift(lendo);
+    return itens.filter(function (c) { return (c.sessao || sessao) === sessao; }).map(function (c) {
+      return { id: c.id, dataHora: c.dataHora, sessao: c.sessao || sessao, operador: c.operador || '',
+        codigo: '(aguardando leitura)', quantidade: null, quantidadeTexto: '', status: 'AGUARDANDO LEITURA',
+        observacao: 'foto guardada no celular; será lida quando houver internet', modo: c.origem };
+    });
+  }
   function exportar() {
-    var lista = daSessao();
+    var aguard = aguardandoComoLinhas();
+    var lista = daSessao().concat(aguard);
     if (!lista.length) { aviso('Nada para exportar nesta sessão.', 'erro'); return; }
+    if (aguard.length) aviso(aguard.length + ' foto(s) ainda sem leitura entraram como "AGUARDANDO LEITURA". Exporte de novo depois.', 'erro', 6000);
     var wb = XLSX.utils.book_new();
     var abaL = XLSX.utils.json_to_sheet(linhasExcel(lista), { cellDates: true, dateNF: 'dd/mm/yyyy hh:mm:ss' });
     abaL['!cols'] = [10, 19, 22, 14, 14, 34, 18, 12, 14, 12, 11, 30, 16].map(function (w) { return { wch: w }; });
@@ -557,12 +816,20 @@
   // ------------------------------------------------------------- início
   renderizar();
   sincronizar();
+  abrirDB().then(function () { return dbOp('fila', 'readonly', function (st) { return st.getAll(); }); }).then(function (itens) {
+    if (!itens || !itens.length) return;
+    itens.sort(function (a, b) { return a.dataHora < b.dataHora ? -1 : 1; });
+    itens.forEach(function (c) { c.liberado = true; c.esperaAte = 0; c.aparicao = null; filaLeitura.push(c); });
+    aviso(itens.length + ' foto(s) guardada(s) para ler.', 'ok');
+    renderizar();
+    processarFila();
+  });
   if (!cfg.url || !cfg.token) setTimeout(function () { abrirConfig('Para começar, abra o link de configuração gerado na planilha (menu Inventário › 3) ou preencha abaixo.'); }, 200);
 
   // ganchos para os testes automáticos
   window.__inventario = {
     versao: VERSAO,
-    estado: function () { return { registros: registros, sessao: sessao, fila: filaLeitura.length, lendo: !!lendo, maquina: maquina.estado }; },
+    estado: function () { return { registros: registros, sessao: sessao, fila: filaLeitura.length, lendo: !!lendo, maquina: maquina.estado, redeOk: redeOk, zoom: { valor: zoom.valor, hw: !!zoom.hw } }; },
     exportar: exportar
   };
 })();
